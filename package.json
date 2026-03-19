@@ -1,0 +1,26 @@
+{
+  "name": "hrms-sysfunda",
+  "version": "1.0.0",
+  "description": "HRMS (PHP, PostgreSQL, Tailwind) — Heroku/Apache or Localhost",
+  "main": "index.js",
+  "scripts": {
+    "build:css": "npx tailwindcss -i assets/css/tailwind-input.css -o assets/css/tailwind.css --minify",
+    "watch:css": "npx tailwindcss -i assets/css/tailwind-input.css -o assets/css/tailwind.css --watch",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Bobsi01/hrms-sysfunda.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Bobsi01/hrms-sysfunda/issues"
+  },
+  "homepage": "https://github.com/Bobsi01/hrms-sysfunda#readme",
+  "devDependencies": {
+    "tailwindcss": "^3.4.19"
+  }
+}

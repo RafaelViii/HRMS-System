@@ -1,0 +1,735 @@
+<?php
+require_once __DIR__ . '/../../../includes/auth.php';
+require_access('payroll', 'compensation_defaults', 'manage');
+require_once __DIR__ . '/../../../includes/db.php';
+require_once __DIR__ . '/../../../includes/utils.php';
+require_once __DIR__ . '/../../../includes/payroll.php';
+
+$pageTitle = 'Compensation Defaults';
+$pdo = get_db_conn();
+$currentUser = current_user();
+$currentUserId = (int)($currentUser['id'] ?? 0);
+action_log('payroll', 'view_compensation_admin');
+
+$searchTerm = trim((string)($_GET['q'] ?? ''));
+$redirectBase = BASE_URL . '/modules/admin/compensation';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $redirectUrl = $redirectBase;
+    if ($searchTerm !== '') {
+        $redirectUrl .= '?q=' . urlencode($searchTerm);
+    }
+
+    if (!csrf_verify($_POST['csrf'] ?? '')) {
+        flash_error('Invalid form token. Please try again.');
+        header('Location: ' . $redirectUrl);
+        exit;
+    }
+
+    $action = trim((string)($_POST['action'] ?? ''));
+
+    try {
+        switch ($action) {
+            case 'save_compensation_defaults':
+                $authz = ensure_action_authorized('payroll', 'compensation_defaults', 'admin');
+                if (!$authz['ok']) {
+                    $msg = $authz['error'] === 'no_access'
+                        ? 'You do not have permission to update compensation defaults.'
+                        : 'Authorization failed. Provide a valid admin credential.';
+                    flash_error($msg);
+                    break;
+                }
+
+                $parseBucket = static function (array $rawBucket, string $labelPrefix, array &$collector): array {
+                    $labels = isset($rawBucket['label']) && is_array($rawBucket['label']) ? $rawBucket['label'] : [];
+                    $codes = isset($rawBucket['code']) && is_array($rawBucket['code']) ? $rawBucket['code'] : [];
+                    $amounts = isset($rawBucket['amount']) && is_array($rawBucket['amount']) ? $rawBucket['amount'] : [];
+                    $max = max(count($labels), count($codes), count($amounts));
+                    $items = [];
+                    for ($i = 0; $i < $max; $i++) {
+                        $label = trim((string)($labels[$i] ?? ''));
+                        $code = trim((string)($codes[$i] ?? ''));
+                        $amountRaw = trim((string)($amounts[$i] ?? ''));
+                        if ($label === '' && $code === '' && $amountRaw === '') {
+                            continue;
+                        }
+                        if ($label === '') {
+                            $collector[] = $labelPrefix . ' row ' . ($i + 1) . ' needs a label.';
+                            continue;
+                        }
+                        if ($amountRaw === '' || !is_numeric($amountRaw)) {
+                            $collector[] = $labelPrefix . ' row ' . ($i + 1) . ' amount must be numeric.';
+                            continue;
+                        }
+                        $items[] = [
+                            'label' => $label,
+                            'code' => $code,
+                            'amount' => (float)$amountRaw,
+                        ];
+                    }
+                    return $items;
+                };
+
+                $collector = [];
+                $allowanceRows = is_array($_POST['allowances'] ?? null) ? $_POST['allowances'] : [];
+                $deductionRows = is_array($_POST['deductions'] ?? null) ? $_POST['deductions'] : [];
+                $allowances = $parseBucket($allowanceRows, 'Allowance', $collector);
+                $deductions = $parseBucket($deductionRows, 'Contribution', $collector);
+
+                $notesRaw = trim((string)($_POST['comp_notes'] ?? ''));
+                $notes = $notesRaw !== '' ? $notesRaw : null;
+
+                $taxPercentage = null;
+                $taxRaw = trim((string)($_POST['tax_percentage'] ?? ''));
+                if ($taxRaw !== '') {
+                    if (!is_numeric($taxRaw)) {
+                        $collector[] = 'Tax percentage must be numeric.';
+                    } else {
+                        $taxPercentage = max(0.0, min(100.0, (float)$taxRaw));
+                    }
+                }
+
+                if ($collector) {
+                    flash_error(implode(' ', array_unique($collector)));
+                    break;
+                }
+
+                $actorId = (int)($authz['as_user'] ?? $currentUserId ?: null) ?: null;
+                $saved = payroll_save_compensation_defaults($pdo, $allowances, $deductions, $notes, $actorId, $taxPercentage);
+                if ($saved) {
+                    $context = [
+                        'allowances' => count($allowances),
+                        'deductions' => count($deductions),
+                        'tax_percentage' => $taxPercentage,
+                        'authorized_by' => $actorId,
+                    ];
+                    action_log('payroll', 'compensation_defaults_saved', 'success', $context);
+                    audit('payroll_comp_defaults_saved', json_encode($context, JSON_UNESCAPED_SLASHES));
+                    flash_success('Payroll compensation defaults updated.');
+                } else {
+                    flash_error('Unable to save compensation defaults.');
+                }
+                break;
+
+            case 'save_overtime_authorizations':
+                $authz = ensure_action_authorized('payroll', 'overtime_authorizations', 'write');
+                if (!$authz['ok']) {
+                    $msg = $authz['error'] === 'no_access'
+                        ? 'You do not have permission to change overtime authorizations.'
+                        : 'Authorization failed. Provide a valid credential.';
+                    flash_error($msg);
+                    break;
+                }
+
+                $idsRaw = $_POST['employee_ids'] ?? [];
+                if (!is_array($idsRaw) || !$idsRaw) {
+                    flash_error('Select at least one employee to update.');
+                    break;
+                }
+                $employeeIds = [];
+                foreach ($idsRaw as $id) {
+                    $empId = (int)$id;
+                    if ($empId > 0) {
+                        $employeeIds[$empId] = true;
+                    }
+                }
+                $employeeIds = array_keys($employeeIds);
+                if (!$employeeIds) {
+                    flash_error('Select at least one employee to update.');
+                    break;
+                }
+
+                $allowOtInput = $_POST['allow_ot'] ?? [];
+                $allowedMap = [];
+                if (is_array($allowOtInput)) {
+                    foreach ($allowOtInput as $empId => $flag) {
+                        $allowedMap[(int)$empId] = true;
+                    }
+                }
+
+                $placeholders = implode(',', array_fill(0, count($employeeIds), '?'));
+                $lookupSql = 'SELECT id, employee_code, first_name, last_name FROM employees WHERE id IN (' . $placeholders . ')';
+                $stmtLookup = $pdo->prepare($lookupSql);
+                foreach ($employeeIds as $idx => $empId) {
+                    $stmtLookup->bindValue($idx + 1, $empId, PDO::PARAM_INT);
+                }
+                $stmtLookup->execute();
+                $existing = $stmtLookup->fetchAll(PDO::FETCH_ASSOC) ?: [];
+                if (!$existing) {
+                    flash_error('The selected employees were not found.');
+                    break;
+                }
+
+                $existingIndex = [];
+                foreach ($existing as $row) {
+                    $existingIndex[(int)$row['id']] = $row;
+                }
+
+                $actorId = (int)($authz['as_user'] ?? $currentUserId ?: null) ?: null;
+                $updated = 0;
+                $enabled = 0;
+                $disabled = 0;
+                $failures = [];
+
+                foreach ($employeeIds as $empId) {
+                    if (!isset($existingIndex[$empId])) {
+                        continue;
+                    }
+                    $allow = !empty($allowedMap[$empId]);
+                    $result = payroll_save_employee_profile($pdo, $empId, ['allow_overtime' => $allow], $actorId);
+                    if ($result) {
+                        $updated++;
+                        if ($allow) {
+                            $enabled++;
+                        } else {
+                            $disabled++;
+                        }
+                    } else {
+                        $failures[] = $existingIndex[$empId]['employee_code'] ?? (string)$empId;
+                    }
+                }
+
+                if ($failures) {
+                    sys_log('PAYROLL-OT-AUTH', 'Failed updating overtime authorization for some employees', [
+                        'module' => 'payroll',
+                        'file' => __FILE__,
+                        'line' => __LINE__,
+                        'context' => ['failures' => $failures],
+                    ]);
+                    flash_error('Unable to update overtime for: ' . implode(', ', array_slice($failures, 0, 5)) . '.');
+                    break;
+                }
+
+                if ($updated === 0) {
+                    flash_error('No overtime authorizations were changed.');
+                    break;
+                }
+
+                $context = [
+                    'updated' => $updated,
+                    'enabled' => $enabled,
+                    'disabled' => $disabled,
+                    'authorized_by' => $actorId,
+                ];
+                action_log('payroll', 'overtime_authorization_updated', 'success', $context);
+                audit('payroll_overtime_authorization_updated', json_encode($context, JSON_UNESCAPED_SLASHES));
+                flash_success('Overtime authorization updated for ' . $updated . ' employee' . ($updated === 1 ? '' : 's') . '.');
+                break;
+
+            default:
+                flash_error('Unsupported action.');
+                break;
+        }
+    } catch (Throwable $e) {
+        sys_log('ADMIN-COMPENSATION-POST', 'Failed processing compensation admin action: ' . $e->getMessage(), [
+            'module' => 'admin',
+            'file' => __FILE__,
+            'line' => __LINE__,
+            'context' => ['action' => $action],
+        ]);
+        flash_error('We could not process the requested change.');
+    }
+
+    header('Location: ' . $redirectUrl);
+    exit;
+}
+
+$payrollDefaults = payroll_get_compensation_defaults($pdo);
+$payrollAllowances = $payrollDefaults['allowances'] ?? [];
+$payrollDeductions = $payrollDefaults['deductions'] ?? [];
+$payrollNotes = (string)($payrollDefaults['notes'] ?? '');
+$payrollTax = isset($payrollDefaults['tax_percentage']) && $payrollDefaults['tax_percentage'] !== null
+    ? (float)$payrollDefaults['tax_percentage']
+    : null;
+$payrollUpdatedAt = $payrollDefaults['updated_at'] ?? null;
+$payrollUpdatedBy = $payrollDefaults['updated_by'] ?? null;
+
+$payrollUpdatedByLabel = null;
+if ($payrollUpdatedBy) {
+    try {
+        $stmtUser = $pdo->prepare('SELECT full_name, email FROM users WHERE id = :id');
+        $stmtUser->execute([':id' => $payrollUpdatedBy]);
+        $userRow = $stmtUser->fetch(PDO::FETCH_ASSOC) ?: null;
+        if ($userRow) {
+            $name = trim((string)($userRow['full_name'] ?? ''));
+            $payrollUpdatedByLabel = $name !== '' ? $name : strtolower((string)($userRow['email'] ?? ''));
+        }
+    } catch (Throwable $e) {
+        sys_log('PAYROLL-COMP-UPDATER', 'Failed resolving payroll defaults updater: ' . $e->getMessage(), [
+            'module' => 'payroll',
+            'file' => __FILE__,
+            'line' => __LINE__,
+        ]);
+    }
+}
+
+$payrollUpdatedAtLabel = null;
+if ($payrollUpdatedAt) {
+  $formatted = format_datetime_display($payrollUpdatedAt, true, '—');
+  $payrollUpdatedAtLabel = $formatted !== '—' ? $formatted : null;
+}
+
+$formatAmount = static function ($value): string {
+    if ($value === null || $value === '') {
+        return '';
+    }
+    $formatted = number_format((float)$value, 2, '.', '');
+    return rtrim(rtrim($formatted, '0'), '.');
+};
+
+$allowanceRows = $payrollAllowances ?: [['code' => '', 'label' => '', 'amount' => '']];
+$deductionRows = $payrollDeductions ?: [['code' => '', 'label' => '', 'amount' => '']];
+
+try {
+    payroll_ensure_employee_profiles_table($pdo);
+} catch (Throwable $e) {
+    sys_log('PAYROLL-PROFILE-TABLE', 'Failed ensuring employee payroll profiles table: ' . $e->getMessage(), [
+        'module' => 'payroll',
+        'file' => __FILE__,
+        'line' => __LINE__,
+    ]);
+}
+
+$employeeRows = [];
+$employeeParams = [];
+$employeeSql = "SELECT e.id, e.employee_code, e.first_name, e.last_name, e.email, e.status, 
+       b.name AS branch_name, 
+       COALESCE(pp.allow_overtime, FALSE) AS allow_overtime,
+       pp.updated_at AS ot_updated_at,
+       u.full_name AS updated_by_name,
+       u.email AS updated_by_email
+FROM employees e
+LEFT JOIN branches b ON b.id = e.branch_id
+LEFT JOIN employee_payroll_profiles pp ON pp.employee_id = e.id
+LEFT JOIN users u ON u.id = pp.updated_by
+WHERE e.status NOT IN ('resigned', 'terminated')";
+if ($searchTerm !== '') {
+    $employeeSql .= " AND (e.first_name ILIKE :term OR e.last_name ILIKE :term OR e.email ILIKE :term OR e.employee_code ILIKE :term)";
+    $employeeParams[':term'] = '%' . $searchTerm . '%';
+}
+$employeeSql .= ' ORDER BY e.first_name ASC, e.last_name ASC, e.id ASC';
+try {
+    $stmtEmp = $pdo->prepare($employeeSql);
+    foreach ($employeeParams as $key => $val) {
+        $stmtEmp->bindValue($key, $val, PDO::PARAM_STR);
+    }
+    $stmtEmp->execute();
+    $employeeRows = $stmtEmp->fetchAll(PDO::FETCH_ASSOC) ?: [];
+} catch (Throwable $e) {
+    sys_log('PAYROLL-OT-LIST', 'Failed loading employee overtime list: ' . $e->getMessage(), [
+        'module' => 'payroll',
+        'file' => __FILE__,
+        'line' => __LINE__,
+    ]);
+    $employeeRows = [];
+}
+
+$otStats = ['total' => count($employeeRows), 'allowed' => 0, 'last_update' => null];
+foreach ($employeeRows as $row) {
+    if (!empty($row['allow_overtime'])) {
+        $otStats['allowed']++;
+    }
+    if (!empty($row['ot_updated_at'])) {
+        $ts = strtotime((string)$row['ot_updated_at']);
+        if ($ts && ($otStats['last_update'] === null || $ts > $otStats['last_update'])) {
+            $otStats['last_update'] = $ts;
+        }
+    }
+}
+$otStats['last_update_label'] = null;
+if ($otStats['last_update']) {
+  $formattedLast = format_datetime_display(date('Y-m-d H:i:s', $otStats['last_update']), true, '—');
+  $otStats['last_update_label'] = $formattedLast !== '—' ? $formattedLast : null;
+}
+
+$csrf = csrf_token();
+
+require_once __DIR__ . '/../../../includes/header.php';
+?>
+
+<div class="space-y-8">
+  <section class="card p-6 md:p-8">
+    <div class="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+      <div class="space-y-2">
+        <div class="flex items-center gap-3 text-sm">
+          <a href="<?= BASE_URL ?>/modules/admin/index" class="inline-flex items-center gap-2 font-semibold text-indigo-600 transition hover:text-indigo-700" data-no-loader>
+            <span class="text-base">←</span>
+            <span>HR Admin</span>
+          </a>
+          <span class="text-slate-400">/</span>
+          <span class="uppercase tracking-[0.2em] text-slate-500">Compensation</span>
+        </div>
+        <h1 class="text-2xl font-semibold text-slate-900">Compensation Defaults</h1>
+        <p class="text-sm text-slate-600">Baseline allowances, deductions, and overtime eligibility applied to payroll runs.</p>
+      </div>
+      <div class="grid gap-3 text-sm sm:grid-cols-3">
+        <div class="rounded-2xl border border-indigo-100 bg-indigo-50 px-4 py-3">
+          <p class="text-[11px] uppercase tracking-wide text-indigo-500">Allowance rows</p>
+          <p class="mt-1 text-2xl font-semibold text-indigo-900"><?= count($payrollAllowances) ?></p>
+          <p class="text-xs text-indigo-600">Cascade to new profiles.</p>
+        </div>
+        <div class="rounded-2xl border border-emerald-100 bg-emerald-50 px-4 py-3">
+          <p class="text-[11px] uppercase tracking-wide text-emerald-500">OT authorized</p>
+          <p class="mt-1 text-2xl font-semibold text-emerald-900"><?= (int)$otStats['allowed'] ?> <span class="text-sm font-medium text-emerald-600">/ <?= (int)$otStats['total'] ?></span></p>
+          <p class="text-xs text-emerald-600">Employees eligible.</p>
+        </div>
+        <div class="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3">
+          <p class="text-[11px] uppercase tracking-wide text-slate-500">Last update</p>
+          <p class="mt-1 text-sm font-semibold text-slate-900"><?= $payrollUpdatedAtLabel ? htmlspecialchars($payrollUpdatedAtLabel) : 'No updates yet' ?></p>
+          <?php if ($payrollUpdatedByLabel): ?>
+            <p class="text-xs text-slate-500">by <?= htmlspecialchars($payrollUpdatedByLabel) ?></p>
+          <?php endif; ?>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card p-6 space-y-6">
+    <div class="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+      <div>
+        <h2 class="text-xl font-semibold text-gray-900">Payroll Compensation Defaults</h2>
+        <p class="text-sm text-gray-600">Configure organization-wide allowances, contributions, and the baseline tax percentage.</p>
+      </div>
+      <div class="text-xs text-gray-500">
+        <?php if ($payrollUpdatedAtLabel): ?>
+          Last updated <?= htmlspecialchars($payrollUpdatedAtLabel) ?><?php if ($payrollUpdatedByLabel): ?> by <?= htmlspecialchars($payrollUpdatedByLabel) ?><?php endif; ?>
+        <?php else: ?>
+          Never updated
+        <?php endif; ?>
+      </div>
+    </div>
+    <div class="grid gap-6 lg:grid-cols-2">
+      <div class="space-y-4">
+        <div class="rounded-lg border border-gray-200 bg-white p-4 shadow-sm">
+          <h3 class="text-sm font-semibold text-gray-800">Current Defaults</h3>
+          <div class="mt-3 space-y-4 text-sm text-gray-700">
+            <div>
+              <div class="text-xs uppercase tracking-wide text-gray-500">Allowances</div>
+              <?php if ($payrollAllowances): ?>
+                <ul class="mt-2 space-y-1">
+                  <?php foreach ($payrollAllowances as $row): ?>
+                    <li class="flex items-center justify-between">
+                      <span><?= htmlspecialchars($row['label'] ?? '') ?></span>
+                      <span class="font-medium">₱<?= number_format((float)($row['amount'] ?? 0), 2) ?></span>
+                    </li>
+                  <?php endforeach; ?>
+                </ul>
+              <?php else: ?>
+                <p class="mt-2 text-gray-500">No default allowances configured.</p>
+              <?php endif; ?>
+            </div>
+            <div>
+              <div class="text-xs uppercase tracking-wide text-gray-500">Contributions</div>
+              <?php if ($payrollDeductions): ?>
+                <ul class="mt-2 space-y-1">
+                  <?php foreach ($payrollDeductions as $row): ?>
+                    <li class="flex items-center justify-between">
+                      <span><?= htmlspecialchars($row['label'] ?? '') ?></span>
+                      <span class="font-medium">₱<?= number_format((float)($row['amount'] ?? 0), 2) ?></span>
+                    </li>
+                  <?php endforeach; ?>
+                </ul>
+              <?php else: ?>
+                <p class="mt-2 text-gray-500">No default contributions configured.</p>
+              <?php endif; ?>
+            </div>
+            <div class="grid grid-cols-2 gap-4">
+              <div>
+                <div class="text-xs uppercase tracking-wide text-gray-500">Default tax</div>
+                <p class="mt-1 font-semibold text-gray-900">
+                  <?= $payrollTax !== null ? htmlspecialchars($formatAmount($payrollTax)) . '%' : 'Not configured' ?>
+                </p>
+              </div>
+              <div>
+                <div class="text-xs uppercase tracking-wide text-gray-500">Notes</div>
+                <p class="mt-1 text-gray-700 leading-relaxed">
+                  <?= $payrollNotes !== '' ? nl2br(htmlspecialchars($payrollNotes)) : '—' ?>
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+        <p class="text-xs text-gray-500">Defaults cascade to all employees unless their payroll profile overrides them.</p>
+      </div>
+      <form method="post" class="rounded-lg border border-gray-200 bg-gray-50 p-4 space-y-4" id="compensationForm"
+            data-authz-module="payroll" data-authz-required="admin" data-authz-force data-authz-action="Update payroll compensation defaults">
+        <input type="hidden" name="csrf" value="<?= $csrf ?>" />
+        <input type="hidden" name="action" value="save_compensation_defaults" />
+        <input type="hidden" name="override_force" value="1" />
+        <div class="space-y-3">
+          <div class="flex items-center justify-between">
+            <h3 class="text-sm font-semibold text-gray-700">Allowance Defaults</h3>
+            <button type="button" class="btn btn-outline text-xs" data-comp-add="allowances">Add Allowance</button>
+          </div>
+          <div class="space-y-3" data-comp-list="allowances">
+            <?php foreach ($allowanceRows as $row): ?>
+              <div class="grid gap-2 md:grid-cols-5" data-comp-row>
+                <div class="md:col-span-2">
+                  <label class="text-xs uppercase tracking-wide text-gray-500">Label</label>
+                  <input type="text" class="input-text w-full" name="allowances[label][]" value="<?= htmlspecialchars($row['label'] ?? '') ?>" placeholder="e.g., Transportation" />
+                </div>
+                <div>
+                  <label class="text-xs uppercase tracking-wide text-gray-500">Code</label>
+                  <input type="text" class="input-text w-full" name="allowances[code][]" value="<?= htmlspecialchars($row['code'] ?? '') ?>" placeholder="Optional" />
+                </div>
+                <div>
+                  <label class="text-xs uppercase tracking-wide text-gray-500">Amount</label>
+                  <input type="number" step="0.01" min="0" class="input-text w-full" name="allowances[amount][]" value="<?= htmlspecialchars($formatAmount($row['amount'] ?? '')) ?>" placeholder="0.00" />
+                </div>
+                <div class="flex items-end justify-end">
+                  <button type="button" class="btn btn-outline text-xs" data-comp-remove>Remove</button>
+                </div>
+              </div>
+            <?php endforeach; ?>
+          </div>
+        </div>
+        <div class="space-y-3">
+          <div class="flex items-center justify-between">
+            <h3 class="text-sm font-semibold text-gray-700">Contribution Defaults</h3>
+            <button type="button" class="btn btn-outline text-xs" data-comp-add="deductions">Add Contribution</button>
+          </div>
+          <div class="space-y-3" data-comp-list="deductions">
+            <?php foreach ($deductionRows as $row): ?>
+              <div class="grid gap-2 md:grid-cols-5" data-comp-row>
+                <div class="md:col-span-2">
+                  <label class="text-xs uppercase tracking-wide text-gray-500">Label</label>
+                  <input type="text" class="input-text w-full" name="deductions[label][]" value="<?= htmlspecialchars($row['label'] ?? '') ?>" placeholder="e.g., SSS" />
+                </div>
+                <div>
+                  <label class="text-xs uppercase tracking-wide text-gray-500">Code</label>
+                  <input type="text" class="input-text w-full" name="deductions[code][]" value="<?= htmlspecialchars($row['code'] ?? '') ?>" placeholder="Optional" />
+                </div>
+                <div>
+                  <label class="text-xs uppercase tracking-wide text-gray-500">Amount</label>
+                  <input type="number" step="0.01" min="0" class="input-text w-full" name="deductions[amount][]" value="<?= htmlspecialchars($formatAmount($row['amount'] ?? '')) ?>" placeholder="0.00" />
+                </div>
+                <div class="flex items-end justify-end">
+                  <button type="button" class="btn btn-outline text-xs" data-comp-remove>Remove</button>
+                </div>
+              </div>
+            <?php endforeach; ?>
+          </div>
+        </div>
+        <div class="grid gap-4 md:grid-cols-2">
+          <div>
+            <label class="text-xs uppercase tracking-wide text-gray-500">Default Tax Percentage</label>
+            <div class="mt-1 flex items-center gap-2">
+              <input type="number" step="0.01" min="0" max="100" class="input-text w-full md:w-32" name="tax_percentage" value="<?= $payrollTax !== null ? htmlspecialchars($formatAmount($payrollTax)) : '' ?>" placeholder="e.g., 8" />
+              <span class="text-sm text-gray-600">%</span>
+            </div>
+            <p class="mt-1 text-xs text-gray-500">Applied before statutory computations; override per employee if needed.</p>
+          </div>
+          <div>
+            <label class="text-xs uppercase tracking-wide text-gray-500">Notes</label>
+            <textarea class="input-text w-full" name="comp_notes" rows="3" placeholder="Context for future changes."><?= htmlspecialchars($payrollNotes) ?></textarea>
+          </div>
+        </div>
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <p class="text-xs text-gray-500">Authorization required. All updates are tracked in the audit trail.</p>
+          <button type="submit" class="btn btn-primary">Save Defaults</button>
+        </div>
+        <template data-comp-template="allowances">
+          <div class="grid gap-2 md:grid-cols-5" data-comp-row>
+            <div class="md:col-span-2">
+              <label class="text-xs uppercase tracking-wide text-gray-500">Label</label>
+              <input type="text" class="input-text w-full" name="allowances[label][]" placeholder="e.g., Transportation" />
+            </div>
+            <div>
+              <label class="text-xs uppercase tracking-wide text-gray-500">Code</label>
+              <input type="text" class="input-text w-full" name="allowances[code][]" placeholder="Optional" />
+            </div>
+            <div>
+              <label class="text-xs uppercase tracking-wide text-gray-500">Amount</label>
+              <input type="number" step="0.01" min="0" class="input-text w-full" name="allowances[amount][]" placeholder="0.00" />
+            </div>
+            <div class="flex items-end justify-end">
+              <button type="button" class="btn btn-outline text-xs" data-comp-remove>Remove</button>
+            </div>
+          </div>
+        </template>
+        <template data-comp-template="deductions">
+          <div class="grid gap-2 md:grid-cols-5" data-comp-row>
+            <div class="md:col-span-2">
+              <label class="text-xs uppercase tracking-wide text-gray-500">Label</label>
+              <input type="text" class="input-text w-full" name="deductions[label][]" placeholder="e.g., SSS" />
+            </div>
+            <div>
+              <label class="text-xs uppercase tracking-wide text-gray-500">Code</label>
+              <input type="text" class="input-text w-full" name="deductions[code][]" placeholder="Optional" />
+            </div>
+            <div>
+              <label class="text-xs uppercase tracking-wide text-gray-500">Amount</label>
+              <input type="number" step="0.01" min="0" class="input-text w-full" name="deductions[amount][]" placeholder="0.00" />
+            </div>
+            <div class="flex items-end justify-end">
+              <button type="button" class="btn btn-outline text-xs" data-comp-remove>Remove</button>
+            </div>
+          </div>
+        </template>
+      </form>
+    </div>
+  </section>
+
+  <section class="card p-6 space-y-6">
+    <div class="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+      <div>
+        <h2 class="text-xl font-semibold text-gray-900">Employee Overtime Authorization</h2>
+        <p class="text-sm text-gray-600">Enable overtime coverage for employees who should accrue OT pay in payroll runs.</p>
+      </div>
+      <div class="text-xs text-gray-500">
+        <?php if ($otStats['last_update_label']): ?>
+          Last change <?= htmlspecialchars($otStats['last_update_label']) ?>
+        <?php else: ?>
+          Pending initial authorization
+        <?php endif; ?>
+      </div>
+    </div>
+    <form method="get" class="flex flex-col gap-2 sm:flex-row sm:items-center">
+      <input type="text" name="q" value="<?= htmlspecialchars($searchTerm) ?>" class="input-text w-full sm:w-64" placeholder="Search name, email, or code">
+      <div class="flex gap-2">
+        <button type="submit" class="btn btn-outline">Search</button>
+        <?php if ($searchTerm !== ''): ?>
+          <a href="<?= $redirectBase ?>" class="btn btn-ghost" data-no-loader>Clear</a>
+        <?php endif; ?>
+      </div>
+    </form>
+    <form method="post" class="space-y-4" data-authz-module="payroll" data-authz-required="write" data-authz-action="Save overtime authorizations">
+      <input type="hidden" name="csrf" value="<?= $csrf ?>" />
+      <input type="hidden" name="action" value="save_overtime_authorizations" />
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <div class="flex items-center gap-2 text-sm text-gray-600">
+          <label class="inline-flex items-center gap-2 text-gray-700">
+            <input type="checkbox" data-ot-select-all />
+            <span>Select all</span>
+          </label>
+          <span class="text-xs text-gray-500">Currently authorized: <strong data-ot-enabled-count><?= (int)$otStats['allowed'] ?></strong> / <?= (int)$otStats['total'] ?></span>
+        </div>
+        <button type="submit" class="btn btn-primary">Save Authorization</button>
+      </div>
+      <div class="overflow-x-auto border border-gray-200 rounded-xl" data-ot-list>
+        <table class="min-w-full divide-y divide-gray-200 text-sm">
+          <thead class="bg-gray-50 text-xs uppercase tracking-wide text-gray-500">
+            <tr>
+              <th class="px-3 py-2 text-left">Allow OT</th>
+              <th class="px-3 py-2 text-left">Employee</th>
+              <th class="px-3 py-2 text-left">Branch</th>
+              <th class="px-3 py-2 text-left">Status</th>
+              <th class="px-3 py-2 text-left">Last Updated</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-gray-100">
+            <?php if (!$employeeRows): ?>
+              <tr>
+                <td colspan="5" class="px-3 py-6 text-center text-sm text-gray-500">No employees found. Adjust the filter or add employees first.</td>
+              </tr>
+            <?php else: ?>
+              <?php foreach ($employeeRows as $row): ?>
+                <?php
+                  $empId = (int)($row['id'] ?? 0);
+                  $updatedLabel = $row['ot_updated_at'] ? format_datetime_display($row['ot_updated_at'], true, '—') : '—';
+                  $updaterName = trim((string)($row['updated_by_name'] ?? ''));
+                  $updaterLabel = $updaterName !== '' ? $updaterName : ($row['updated_by_email'] ? strtolower((string)$row['updated_by_email']) : '');
+                ?>
+                <tr class="bg-white hover:bg-gray-50">
+                  <td class="px-3 py-3">
+                    <input type="hidden" name="employee_ids[]" value="<?= $empId ?>" />
+                    <input type="checkbox" name="allow_ot[<?= $empId ?>]" data-ot-toggle <?= !empty($row['allow_overtime']) ? 'checked' : '' ?> />
+                  </td>
+                  <td class="px-3 py-3">
+                    <div class="font-medium text-gray-900"><?= htmlspecialchars(($row['first_name'] ?? '') . ' ' . ($row['last_name'] ?? '')) ?></div>
+                    <div class="text-xs text-gray-500 flex items-center gap-2">
+                      <span class="font-mono text-[11px] uppercase"><?= htmlspecialchars($row['employee_code'] ?? '') ?></span>
+                      <span><?= htmlspecialchars(strtolower((string)($row['email'] ?? ''))) ?></span>
+                    </div>
+                  </td>
+                  <td class="px-3 py-3 text-sm text-gray-700"><?= htmlspecialchars($row['branch_name'] ?? '—') ?></td>
+                  <td class="px-3 py-3 text-sm">
+                    <span class="inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide <?= ($row['status'] ?? '') === 'active' ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-600' ?>">
+                      <?= htmlspecialchars((string)($row['status'] ?? 'unknown')) ?>
+                    </span>
+                  </td>
+                  <td class="px-3 py-3 text-xs text-gray-500">
+                    <div><?= htmlspecialchars($updatedLabel) ?></div>
+                    <?php if ($updaterLabel): ?>
+                      <div>by <?= htmlspecialchars($updaterLabel) ?></div>
+                    <?php endif; ?>
+                  </td>
+                </tr>
+              <?php endforeach; ?>
+            <?php endif; ?>
+          </tbody>
+        </table>
+      </div>
+      <p class="text-xs text-gray-500">Employees without an overtime authorization remain ineligible for OT pay until granted.</p>
+    </form>
+  </section>
+</div>
+
+<script>
+(function(){
+  const form = document.getElementById('compensationForm');
+  if (!form) { return; }
+  function addRow(type) {
+    if (!type) { return; }
+    const template = form.querySelector(`template[data-comp-template="${type}"]`);
+    const list = form.querySelector(`[data-comp-list="${type}"]`);
+    if (!template || !list) { return; }
+    const clone = template.content.firstElementChild.cloneNode(true);
+    list.appendChild(clone);
+    const input = clone.querySelector('input');
+    if (input) { input.focus(); }
+  }
+  form.querySelectorAll('[data-comp-add]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      addRow(btn.getAttribute('data-comp-add'));
+    });
+  });
+  form.addEventListener('click', (event) => {
+    const removeBtn = event.target.closest('[data-comp-remove]');
+    if (!removeBtn) { return; }
+    const row = removeBtn.closest('[data-comp-row]');
+    if (!row) { return; }
+    const list = row.parentElement;
+    const type = list ? list.getAttribute('data-comp-list') : null;
+    row.remove();
+    if (type && !list.querySelector('[data-comp-row]')) {
+      addRow(type);
+    }
+  });
+})();
+</script>
+<script>
+(function(){
+  const selectAll = document.querySelector('[data-ot-select-all]');
+  const container = document.querySelector('[data-ot-list] tbody');
+  const enabledLabel = document.querySelector('[data-ot-enabled-count]');
+  if (!selectAll || !container) { return; }
+  const checkboxes = () => Array.from(container.querySelectorAll('input[data-ot-toggle]'));
+  function updateSelectAllState() {
+    const boxes = checkboxes();
+    if (!boxes.length) { return; }
+    const allChecked = boxes.every(cb => cb.checked);
+    const anyChecked = boxes.some(cb => cb.checked);
+    selectAll.indeterminate = !allChecked && anyChecked;
+    selectAll.checked = allChecked;
+  }
+  function updateEnabledLabel() {
+    if (!enabledLabel) { return; }
+    const count = checkboxes().filter(cb => cb.checked).length;
+    enabledLabel.textContent = count;
+  }
+  selectAll.addEventListener('change', () => {
+    checkboxes().forEach(cb => { cb.checked = selectAll.checked; });
+    updateSelectAllState();
+    updateEnabledLabel();
+  });
+  container.addEventListener('change', (event) => {
+    if (!event.target.matches('input[data-ot-toggle]')) { return; }
+    updateSelectAllState();
+    updateEnabledLabel();
+  });
+  updateSelectAllState();
+  updateEnabledLabel();
+})();
+</script>
+<?php require_once __DIR__ . '/../../../includes/footer.php'; ?>

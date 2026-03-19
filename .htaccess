@@ -1,0 +1,53 @@
+DirectoryIndex index.php
+
+# Basic hardening and predictable routing
+Options -Indexes -MultiViews
+
+# ─── Security Headers (applied to all responses including static assets) ───
+<IfModule mod_headers.c>
+  Header always set X-Frame-Options "SAMEORIGIN"
+  Header always set X-Content-Type-Options "nosniff"
+  Header always set X-XSS-Protection "1; mode=block"
+  Header always set Referrer-Policy "strict-origin-when-cross-origin"
+  Header always set Permissions-Policy "camera=(), microphone=(), geolocation=()"
+  # HSTS — enforce HTTPS for 1 year
+  Header always set Strict-Transport-Security "max-age=31536000; includeSubDomains" env=HTTPS
+</IfModule>
+
+RewriteEngine On
+
+# ----- Strip accidental '/app' prefix (e.g., from external forwarding) -----
+RewriteCond %{REQUEST_URI} ^/app(/.*)?$ [NC]
+RewriteRule ^app/?(.*)$ /$1 [L,R=302]
+
+# ----- HTTPS handling behind proxies (Heroku) -----
+# Treat request as HTTPS if forwarded by proxy
+RewriteCond %{HTTP:X-Forwarded-Proto} =https [OR]
+RewriteCond %{HTTPS} =on
+RewriteRule ^ - [E=HTTPS:on]
+
+# Force HTTPS only when not already HTTPS (avoid loops on Heroku)
+RewriteCond %{HTTPS} !=on
+RewriteCond %{HTTP:X-Forwarded-Proto} !https
+RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+
+# ----- Canonical: remove .php in public URLs (GET/HEAD only) -----
+RewriteCond %{THE_REQUEST} \s/+(.+?)\.php[\s?] [NC]
+RewriteCond %{REQUEST_METHOD} ^GET|HEAD$
+RewriteRule ^ %1 [R=301,L]
+
+# 1) Serve existing files as is
+RewriteCond %{REQUEST_FILENAME} -f
+RewriteRule ^ - [L]
+
+# 2) If the request maps to a directory that contains index.php, serve that explicitly
+RewriteCond %{REQUEST_FILENAME} -d
+RewriteCond %{REQUEST_FILENAME}/index.php -f
+RewriteRule ^(.+?)/?$ $1/index.php [L]
+
+# 3) Internally rewrite extensionless paths to .php when a matching file exists
+RewriteCond %{REQUEST_FILENAME}.php -f
+RewriteRule ^(.+)$ $1.php [L]
+
+# 4) Fallback to root index.php (front controller)
+RewriteRule ^ index.php [L]

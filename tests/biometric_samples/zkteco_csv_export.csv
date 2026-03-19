@@ -1,0 +1,33 @@
+No,EnrollNumber,Name,GMTDate,Mode
+1,1,Daniel Bobis,2026-02-09 08:02:31,Check-In
+2,2,Rafael Virnel Beringuela,2026-02-09 07:55:10,Check-In
+3,3,Christian Paul Bautista,2026-02-09 08:15:44,Check-In
+4,4,Adrian Velasco,2026-02-09 08:30:02,Check-In
+5,1,Daniel Bobis,2026-02-09 12:01:15,Check-Out
+6,2,Rafael Virnel Beringuela,2026-02-09 12:05:22,Check-Out
+7,3,Christian Paul Bautista,2026-02-09 12:10:08,Check-Out
+8,4,Adrian Velasco,2026-02-09 12:00:55,Check-Out
+9,1,Daniel Bobis,2026-02-09 13:00:45,Check-In
+10,2,Rafael Virnel Beringuela,2026-02-09 13:02:18,Check-In
+11,3,Christian Paul Bautista,2026-02-09 13:05:30,Check-In
+12,4,Adrian Velasco,2026-02-09 13:01:10,Check-In
+13,1,Daniel Bobis,2026-02-09 17:05:20,Check-Out
+14,2,Rafael Virnel Beringuela,2026-02-09 17:30:45,Check-Out
+15,3,Christian Paul Bautista,2026-02-09 17:02:15,Check-Out
+16,4,Adrian Velasco,2026-02-09 18:15:30,Check-Out
+17,1,Daniel Bobis,2026-02-10 07:58:12,Check-In
+18,2,Rafael Virnel Beringuela,2026-02-10 08:01:05,Check-In
+19,3,Christian Paul Bautista,2026-02-10 08:20:33,Check-In
+20,4,Adrian Velasco,2026-02-10 07:50:22,Check-In
+21,1,Daniel Bobis,2026-02-10 17:00:10,Check-Out
+22,2,Rafael Virnel Beringuela,2026-02-10 17:15:28,Check-Out
+23,3,Christian Paul Bautista,2026-02-10 17:45:50,Check-Out
+24,4,Adrian Velasco,2026-02-10 19:00:05,Check-Out
+25,1,Daniel Bobis,2026-02-11 08:05:00,Check-In
+26,2,Rafael Virnel Beringuela,2026-02-11 07:48:15,Check-In
+27,3,Christian Paul Bautista,2026-02-11 09:10:22,Check-In
+28,4,Adrian Velasco,2026-02-11 08:00:30,Check-In
+29,1,Daniel Bobis,2026-02-11 17:10:33,Check-Out
+30,2,Rafael Virnel Beringuela,2026-02-11 17:00:05,Check-Out
+31,3,Christian Paul Bautista,2026-02-11 17:30:18,Check-Out
+32,4,Adrian Velasco,2026-02-11 17:45:40,Check-Out

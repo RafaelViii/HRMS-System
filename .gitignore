@@ -1,0 +1,11 @@
+node_modules/
+package-lock.json
+/vendor/
+.phpunit.cache/
+assets/certs/qz-private-key.pem
+
+# Secrets — never commit environment files or private keys
+.env
+.env.*
+*.pem
+!assets/certs/qz-cert.pem

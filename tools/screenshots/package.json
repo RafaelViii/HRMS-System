@@ -1,0 +1,20 @@
+{
+  "name": "hrms-screenshots",
+  "version": "1.0.0",
+  "description": "Automated screenshot capture for HRIS app pages",
+  "main": "screenshot.js",
+  "scripts": {
+    "capture": "node screenshot.js",
+    "capture:desktop": "node screenshot.js --viewport=desktop",
+    "capture:mobile": "node screenshot.js --viewport=mobile",
+    "static": "node static-site.js",
+    "static:desktop": "node static-site.js --viewport=desktop",
+    "static:mobile": "node static-site.js --viewport=mobile",
+    "static:resume": "node static-site.js --resume"
+  },
+  "dependencies": {
+    "puppeteer": "^23.0.0",
+    "pdf-lib": "^1.17.1",
+    "cheerio": "^1.0.0"
+  }
+}
